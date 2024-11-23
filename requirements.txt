@@ -1,0 +1,10 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+python-dotenv==1.0.0
+supabase==2.0.3
+python-multipart==0.0.6
+email-validator==2.1.0.post1
+groq==0.12.0
+python-jose==3.3.0
+imap-tools==1.5.0
+pytz==2024.1
