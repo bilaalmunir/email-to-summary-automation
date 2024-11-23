@@ -23,3 +23,6 @@ Thumbs.db
 *.cache
 *.egg-info/
 .eggs/
+
+.env
+app/__pycache__/main.cpython-312.pyc
