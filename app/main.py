@@ -1,18 +1,16 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-from typing import List, Optional
+from typing import List
 import os
 from dotenv import load_dotenv
-import re
-import json
 from datetime import datetime, timedelta
 import pytz
 import groq
 from pydantic import BaseModel
 from imap_tools import MailBox, AND
-from email.utils import parseaddr
 import logging
+import ssl
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -75,7 +73,7 @@ def summarize_single_email(email_content: dict) -> str:
             f"Subject: {email_content['subject']}\n"
             f"From: {email_content['from_address']}\n"
             f"Date: {email_content['date']}\n"
-            f"Content: {email_content['text'][:2000]}..."  # Increased limit for better context
+            f"Content: {email_content['text'][:2000]}..."  
         )
         
         logger.info(f"Generating summary for email: {email_content['subject'][:30]}...")
@@ -105,60 +103,103 @@ def extract_emails_from_inbox(email_address: str, password: str, sender_addresse
     email_data = []
     
     try:
-        logger.info(f"Attempting to connect to Gmail IMAP for: {email_address}")
+        logger.info(f"Attempting to connect to Zoho IMAP for: {email_address}")
         
         # Calculate the date 24 hours ago in UTC
         utc = pytz.UTC
         date_since = datetime.now(utc) - timedelta(days=1)
         
-        # For Gmail, we'll use SSL connection
-        with MailBox('imap.gmail.com').login(email_address, password, initial_folder='INBOX') as mailbox:
-            logger.info("Successfully connected to Gmail")
+        # Try alternative IMAP settings
+        import imaplib
+        import email
+        from email.header import decode_header
+        
+        # Set up SSL context
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        try:
+            # Connect using imaplib first to test connection
+            logger.debug("Attempting direct IMAP connection...")
+            imap = imaplib.IMAP4_SSL('imap.zoho.eu', 993, ssl_context=ssl_context)
             
-            for sender in sender_addresses:
-                logger.info(f"Fetching emails from sender: {sender}")
-                # Search criteria: from specific sender and within last 24 hours
-                criteria = AND(
-                    from_=sender,
-                    date_gte=date_since.date()
+            try:
+                # Try login
+                logger.debug(f"Attempting login for {email_address}")
+                imap.login(email_address, password)
+                imap.logout()
+                
+                # If login successful, proceed with imap_tools
+                logger.debug("Login successful, proceeding with email fetch")
+                with MailBox('imap.zoho.eu').login(email_address, password, initial_folder='INBOX') as mailbox:
+                    logger.info("Successfully connected to Zoho")
+                    
+                    for sender in sender_addresses:
+                        logger.info(f"Fetching emails from sender: {sender}")
+                        criteria = AND(
+                            from_=sender,
+                            date_gte=date_since.date()
+                        )
+                        messages = mailbox.fetch(criteria=criteria)
+                        for msg in messages:
+                            try:
+                                msg_date = msg.date.replace(tzinfo=utc)
+                                if msg_date >= date_since:
+                                    email_content = {
+                                        "subject": msg.subject,
+                                        "from_address": msg.from_,
+                                        "to_address": ", ".join(msg.to),
+                                        "date": msg_date.isoformat(),
+                                        "text": msg.text or msg.html,
+                                        "extracted_at": datetime.now(utc).isoformat()
+                                    }
+                                    
+                                    email_content["summary"] = summarize_single_email(email_content)
+                                    email_data.append(email_content)
+                                    logger.info(f"Processed email: {msg.subject[:30]}...")
+                            except Exception as e:
+                                logger.error(f"Error processing individual email: {str(e)}")
+                                continue
+                    
+                    logger.info(f"Successfully extracted {len(email_data)} emails")
+                    return email_data
+                    
+            except imaplib.IMAP4.error as e:
+                error_msg = str(e)
+                logger.error(f"IMAP Authentication Error: {error_msg}")
+                raise HTTPException(
+                    status_code=401,
+                    detail={
+                        "message": "Failed to authenticate with IMAP server",
+                        "error": error_msg,
+                        "email": email_address,
+                        "server": "imap.zoho.eu",
+                        "suggestions": [
+                            "Verify email address is correct",
+                            "Make sure IMAP is enabled in Zoho Mail settings",
+                            "Try generating a new app-specific password",
+                            "Check if there are any IP restrictions in Zoho settings"
+                        ]
+                    }
                 )
                 
-                messages = mailbox.fetch(criteria=criteria)
-                
-                for msg in messages:
-                    try:
-                        # Convert message date to UTC for comparison
-                        msg_date = msg.date.replace(tzinfo=utc)
-                        logger.debug(f"Message date: {msg_date}, Comparing with: {date_since}")
-                        
-                        # Only process if the message is within the last 24 hours
-                        if msg_date >= date_since:
-                            email_content = {
-                                "subject": msg.subject,
-                                "from_address": msg.from_,
-                                "to_address": ", ".join(msg.to),
-                                "date": msg_date.isoformat(),
-                                "text": msg.text or msg.html,  # Fallback to HTML if text is empty
-                                "extracted_at": datetime.now(utc).isoformat()
-                            }
-                            
-                            # Generate summary for this specific email
-                            email_content["summary"] = summarize_single_email(email_content)
-                            
-                            email_data.append(email_content)
-                            logger.info(f"Processed email: {msg.subject[:30]}...")
-                        else:
-                            logger.debug(f"Skipping email from {msg_date} as it's older than {date_since}")
-                    except Exception as e:
-                        logger.error(f"Error processing individual email: {str(e)}")
-                        continue
-        
-        logger.info(f"Successfully extracted {len(email_data)} emails")
-        return email_data
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Connection Error: {error_msg}")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Failed to connect to IMAP server",
+                    "error": error_msg,
+                    "email": email_address,
+                    "server": "imap.zoho.eu"
+                }
+            )
     
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"Failed to fetch emails: {error_msg}")
+        logger.error(f"General error in extract_emails_from_inbox: {error_msg}")
         raise HTTPException(
             status_code=500,
             detail={
